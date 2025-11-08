@@ -19,7 +19,7 @@ from datetime import datetime
 CONFIG_FILE = Path.home() / ".audio_downloader_config.json"
 
 DEFAULT_CONFIG = {
-    "format": "flac",
+    "format": "flac",  # Lossless format
     "quality": "best",
     "output_dir": "./downloads",
     "output_template": "%(title)s.%(ext)s",
@@ -34,7 +34,12 @@ DEFAULT_CONFIG = {
     "rate_limit": None,  # Speed limit (e.g., "1M" for 1MB/s)
     "retries": 3,
     "geo_bypass": True,
-    "prefer_free_formats": False
+    "prefer_free_formats": False,
+    "no_overwrites": True,  # Don't overwrite existing files by default
+    "proxy": None,  # Proxy support
+    "bitrate": "0",  # Highest quality (0 means best for most formats)
+    "sample_rate": None,  # Let yt-dlp decide best sample rate
+    "postprocessor_args": None  # Additional FFmpeg args for highest quality
 }
 
 
@@ -67,8 +72,10 @@ class Config:
                 self.settings[key] = value
         # Don't persist video format - always revert to audio
         if 'format' in kwargs and kwargs['format'] in ['mp4', 'mkv', 'webm', 'avi']:
-            pass  # Temporary
+            # For video formats, don't save to persist the original audio format
+            pass  # Temporary - don't save
         else:
+            # Save all other settings including proxy, etc.
             self.save()
     
     def display(self):
@@ -92,17 +99,71 @@ class Downloader:
     
     def check_dependencies(self):
         """Verify yt-dlp and ffmpeg are installed"""
-        deps = {'yt-dlp': 'yt-dlp', 'ffmpeg': 'ffmpeg'}
+        deps = {'yt-dlp': 'yt-dlp'}
         missing = []
         
+        # Check yt-dlp first
         for name, cmd in deps.items():
+            timeout_val = 10
             try:
+                # Try with shell=True to ensure PATH is properly inherited
                 subprocess.run([cmd, '--version'], 
                              capture_output=True, 
                              check=True,
-                             timeout=5)
+                             timeout=timeout_val)
             except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-                missing.append(name)
+                # If direct call fails, try using shutil.which to find the executable
+                import shutil
+                cmd_path = shutil.which(cmd)
+                if cmd_path:
+                    try:
+                        subprocess.run([cmd_path, '--version'], 
+                                     capture_output=True, 
+                                     check=True,
+                                     timeout=timeout_val)
+                    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                        missing.append(name)
+                else:
+                    missing.append(name)
+        
+        # Check ffmpeg separately since it may return different exit codes
+        try:
+            result = subprocess.run(['ffmpeg', '-version'], 
+                                 capture_output=True, 
+                                 timeout=15)
+            # ffmpeg might return 0 for success or 8 for version command, both indicate it works
+            if result.returncode not in [0, 8]:
+                # If version check fails, try a simple info command
+                result2 = subprocess.run(['ffmpeg', '-h'], 
+                                       capture_output=True, 
+                                       timeout=15)
+                if result2.returncode not in [0, 1]:  # 1 is normal for help command
+                    # Try to find ffmpeg with shutil.which
+                    import shutil
+                    ffmpeg_path = shutil.which('ffmpeg')
+                    if ffmpeg_path:
+                        result3 = subprocess.run([ffmpeg_path, '-version'], 
+                                               capture_output=True, 
+                                               timeout=15)
+                        if result3.returncode not in [0, 8]:
+                            missing.append('ffmpeg')
+                    else:
+                        missing.append('ffmpeg')
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            # Try to find ffmpeg with shutil.which
+            import shutil
+            ffmpeg_path = shutil.which('ffmpeg')
+            if ffmpeg_path:
+                try:
+                    result = subprocess.run([ffmpeg_path, '-version'], 
+                                         capture_output=True, 
+                                         timeout=15)
+                    if result.returncode not in [0, 8]:
+                        missing.append('ffmpeg')
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    missing.append('ffmpeg')
+            else:
+                missing.append('ffmpeg')
         
         if missing:
             print(f"ERROR: Missing dependencies: {', '.join(missing)}")
@@ -113,6 +174,7 @@ class Downloader:
             if 'ffmpeg' in missing:
                 print("  # Install ffmpeg:")
                 print("  # - Ubuntu/Debian: sudo apt install ffmpeg")
+                print("  # - Fedora/RHEL: sudo dnf install ffmpeg")
                 print("  # - macOS: brew install ffmpeg")
                 print("  # - Windows: Download from https://ffmpeg.org/")
             sys.exit(1)
@@ -343,12 +405,15 @@ class Downloader:
             print("No new URLs to download!")
             return
         
+        # Determine quality level
+        quality_level = self.config.settings.get('quality', 'best')
+        
         print(f"\n{'='*70}")
         print(f"DOWNLOAD SESSION STARTED: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*70}")
         print(f"URLs to process: {len(urls)}")
         print(f"Format: {fmt.upper() if not video else 'VIDEO (MP4)'}")
-        print(f"Quality: Best available (lossless for audio)")
+        print(f"Quality: {quality_level}")
         print(f"Output directory: {output_dir}")
         print(f"Naming scheme: {naming_scheme}")
         print(f"Metadata embedding: {'Enabled' if self.config.settings['embed_metadata'] else 'Disabled'}")
@@ -367,9 +432,9 @@ class Downloader:
                 # Build yt-dlp command
                 cmd = ['yt-dlp']
                 
-                # Playlist handling
+                # Playlist handling - update to properly detect playlists
                 playlist_url = None
-                if 'playlist' in url_type or '&list=' in url:
+                if url_type == 'youtube_playlist' or '&list=' in url:
                     cmd.append('--yes-playlist')
                     playlist_url = url
                 else:
@@ -379,14 +444,48 @@ class Downloader:
                 if video:
                     cmd.extend(['-f', 'bestvideo+bestaudio/best'])
                 else:
-                    cmd.extend(['-f', 'bestaudio/best'])
+                    # Set quality based on setting
+                    if quality_level == "best":
+                        cmd.extend(['-f', 'bestaudio/best'])
+                        audio_quality = '0'  # Best quality
+                    elif quality_level == "high":
+                        cmd.extend(['-f', 'bestaudio/best'])
+                        audio_quality = '0'  # Still best but may be limited differently
+                    elif quality_level == "medium":
+                        cmd.extend(['-f', 'bestaudio/best'])
+                        audio_quality = '3'  # Medium quality
+                    elif quality_level == "low":
+                        cmd.extend(['-f', 'bestaudio/best'])
+                        audio_quality = '9'  # Lower quality
+                    else:
+                        cmd.extend(['-f', 'bestaudio/best'])
+                        audio_quality = '0'  # Default to best if unknown quality
                     
                     # Audio extraction and conversion
                     cmd.extend([
                         '--extract-audio',
                         '--audio-format', fmt,
-                        '--audio-quality', '0',  # Best quality
+                        '--audio-quality', audio_quality,
                     ])
+                
+                # Additional options to handle YouTube restrictions (only for YouTube)
+                if 'youtube.com' in url or 'youtu.be' in url:
+                    # Enhanced options to bypass YouTube restrictions
+                    cmd.extend([
+                        '--extractor-args', 'youtube:player-client=web',
+                        '--no-check-certificate',
+                        # Playlist handling based on URL
+                        '--yes-playlist' if ('playlist' in url or '&list=' in url) else '--no-playlist',
+                        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                        '--add-header', 'Referer: https://www.youtube.com/',
+                        '--add-header', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        '--sleep-interval', '1',
+                        '--max-sleep-interval', '3'
+                    ])
+                
+                # Add proxy support if configured
+                if self.config.settings.get('proxy'):
+                    cmd.extend(['--proxy', self.config.settings['proxy']])
                 
                 # Output template
                 if organize:
@@ -412,7 +511,13 @@ class Downloader:
                 cmd.extend([
                     '--no-warnings',
                     '--ignore-errors',
-                    '--no-overwrites',
+                ])
+                
+                # Handle overwrites setting (if it's False, don't add --no-overwrites)
+                if self.config.settings.get('no_overwrites', True):
+                    cmd.append('--no-overwrites')
+                
+                cmd.extend([
                     '--retries', str(self.config.settings['retries']),
                 ])
                 
@@ -433,31 +538,96 @@ class Downloader:
                 
                 # FFmpeg postprocessor args for maximum quality
                 if not video:
-                    if fmt == 'flac':
-                        cmd.extend(['--postprocessor-args', 'ffmpeg:-compression_level 0'])
-                    elif fmt == 'wav':
-                        cmd.extend(['--postprocessor-args', 'ffmpeg:-c:a pcm_s24le'])
+                    # Use custom postprocessor args if specified in config, otherwise defaults
+                    if self.config.settings.get('postprocessor_args'):
+                        cmd.extend(['--postprocessor-args', self.config.settings['postprocessor_args']])
                     else:
-                        cmd.extend(['--postprocessor-args', 'ffmpeg:-q:a 0'])
+                        if fmt == 'flac':
+                            # Highest quality FLAC: compression level 0 (fastest) or 12 (most compressed)
+                            # For quality, use compression level 0 or 8 for best quality
+                            cmd.extend(['--postprocessor-args', 'ffmpeg:-compression_level 0 -sample_fmt s32'])  # 32-bit for highest quality
+                        elif fmt == 'wav':
+                            # 24-bit WAV for highest quality
+                            cmd.extend(['--postprocessor-args', 'ffmpeg:-c:a pcm_s24le'])
+                        else:
+                            # Adjust quality based on setting for non-FLAC formats, with 24-bit sample format
+                            cmd.extend([f'--postprocessor-args', f'ffmpeg:-q:a {audio_quality} -sample_fmt s32'])
                 
                 cmd.append(url)
                 
-                # Execute download
+                # Execute download with retry logic for YouTube
                 print(f"  Downloading...")
-                result = subprocess.run(cmd, capture_output=True, text=True)
                 
-                if result.returncode == 0:
-                    print(f"  ✓ Successfully downloaded")
-                    success_count += 1
-                    self.save_to_archive(url)
-                else:
-                    print(f"  ✗ Failed to download")
-                    if result.stderr:
-                        error_lines = result.stderr.split('\n')
-                        relevant_errors = [line for line in error_lines if 'ERROR' in line]
-                        if relevant_errors:
-                            print(f"     Error: {relevant_errors[0][:100]}")
-                    fail_count += 1
+                # Try multiple approaches for YouTube if the first one fails
+                retry_strategies = [cmd]  # Default command
+                
+                # If it's a YouTube URL, add alternative strategies
+                if 'youtube.com' in url or 'youtu.be' in url:
+                    # Strategy 2: Different player client
+                    cmd_alt1 = cmd.copy()
+                    for i, arg in enumerate(cmd_alt1):
+                        if arg == '--extractor-args':
+                            # Replace existing extractor args
+                            cmd_alt1[i+1] = 'youtube:player-client=android'
+                            break
+                    else:
+                        # If no extractor args were found, add them
+                        cmd_alt1.extend(['--extractor-args', 'youtube:player-client=android'])
+                    
+                    # Strategy 3: Direct video download then audio extraction (fallback)
+                    cmd_alt2 = ['yt-dlp']
+                    cmd_alt2.extend(['--no-playlist', '-f', 'best', '--extract-audio', '--audio-format', fmt, '--audio-quality', audio_quality])
+                    cmd_alt2.extend(['-o', output_path])
+                    if self.config.settings.get('embed_metadata') and not video:
+                        cmd_alt2.append('--embed-metadata')
+                        cmd_alt2.extend(self.build_metadata_args(url, playlist_url))
+                    if self.config.settings.get('embed_thumbnail') and not video:
+                        cmd_alt2.extend(['--embed-thumbnail', '--convert-thumbnails', 'jpg'])
+                    cmd_alt2.extend(['--no-warnings', '--ignore-errors'])
+                    if self.config.settings.get('no_overwrites', True):
+                        cmd_alt2.append('--no-overwrites')
+                    cmd_alt2.extend(['--retries', str(self.config.settings['retries'])])
+                    if self.config.settings.get('rate_limit'):
+                        cmd_alt2.extend(['--limit-rate', self.config.settings['rate_limit']])
+                    if self.config.settings.get('geo_bypass'):
+                        cmd_alt2.append('--geo-bypass')
+                    cmd_alt2.extend(['--user-agent', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'])
+                    cmd_alt2.append(url)
+                    
+                    retry_strategies = [cmd, cmd_alt1, cmd_alt2]
+                
+                download_success = False
+                for i, attempt_cmd in enumerate(retry_strategies):
+                    try:
+                        print(f"    Attempt {i+1}/{len(retry_strategies)}...")
+                        result = subprocess.run(attempt_cmd, capture_output=True, text=True, timeout=120)  # 2 minute timeout per download
+                        
+                        if result.returncode == 0:
+                            print(f"  ✓ Successfully downloaded")
+                            success_count += 1
+                            self.save_to_archive(url)
+                            download_success = True
+                            break  # Success, exit retry loop
+                        else:
+                            print(f"    Attempt {i+1} failed (return code: {result.returncode})")
+                            if i == len(retry_strategies) - 1:  # Last attempt
+                                if result.stderr:
+                                    error_lines = result.stderr.split('\n')
+                                    relevant_errors = [line for line in error_lines if 'ERROR' in line]
+                                    if relevant_errors:
+                                        print(f"     Error: {relevant_errors[0][:100]}")
+                                fail_count += 1
+                    except subprocess.TimeoutExpired:
+                        print(f"    Attempt {i+1} timed out (2 minutes)")
+                        if i == len(retry_strategies) - 1:  # Last attempt
+                            fail_count += 1
+                    except Exception as e:
+                        print(f"    Attempt {i+1} error: {str(e)[:100]}")
+                        if i == len(retry_strategies) - 1:  # Last attempt
+                            fail_count += 1
+                
+                if not download_success and len(retry_strategies) > 1:
+                    print(f"  ✗ All {len(retry_strategies)} download attempts failed")
                     
             except KeyboardInterrupt:
                 print("\n\nDownload interrupted by user")
@@ -499,13 +669,17 @@ EXAMPLES:
   
   Organization:
     %(prog)s -o ./music --organize urls.txt     # Organize by source
-    %(prog)s -t "%(artist)s/%(album)s/%(title)s.%(ext)s" urls.txt
+    %(prog)s -t "<artist>/<album>/<title>.<ext>" urls.txt
   
   Advanced features:
     %(prog)s --archive downloads.txt urls.txt   # Track & skip duplicates
     %(prog)s --rate-limit 1M urls.txt           # Limit to 1MB/s
     %(prog)s --date-after 20231201 urls.txt     # Only recent videos
     %(prog)s --no-metadata urls.txt             # Skip metadata embedding
+  
+  Colab Integration:
+    %(prog)s --colab-process ./audio_folder     # Process audio with MelBandRoformer
+    %(prog)s --colab-notebook URL --input-dir ./music  # Custom notebook
   
   File formats supported:
     Text files (.txt) - One URL per line, # for comments
@@ -590,6 +764,34 @@ NAMING SCHEMES:
                                help='Disable geographic restriction bypass')
     download_group.add_argument('--prefer-free-formats', action='store_true',
                                help='Prefer free formats over proprietary ones')
+    download_group.add_argument('--proxy',
+                               help='Proxy URL (e.g., http://proxy:8080 or socks5://127.0.0.1:1080)')
+    download_group.add_argument('-p', '--playlist',  # Short option added
+                               help='Download entire playlist when URL includes playlist parameter',
+                               action='store_true')
+    download_group.add_argument('--bitrate',
+                               help='Audio bitrate (e.g., 320 for 320kbps, 0 for best)')
+    download_group.add_argument('--sample-rate', '--sr',
+                               help='Audio sample rate (e.g., 44100, 48000, 96000)')
+    download_group.add_argument('--24bit', '--hi-res', dest='hi_res', action='store_true',
+                               help='Use high-resolution settings for highest quality')
+    
+    # Colab integration options
+    colab_group = parser.add_argument_group('colab integration options')
+    colab_group.add_argument('--colab-process', metavar='DIR',
+                            help='Process audio folder with Google Colab MelBandRoformer')
+    colab_group.add_argument('--colab-notebook',
+                            help='Custom Colab notebook URL (default: MelBandRoformer)')
+    colab_group.add_argument('--colab-segment-size', type=int, default=256,
+                            help='MelBandRoformer segment size (default: 256)')
+    colab_group.add_argument('--colab-overlap', type=float, default=0.25,
+                            help='MelBandRoformer overlap (default: 0.25)')
+    colab_group.add_argument('--colab-output',
+                            help='Output directory for processed audio')
+    colab_group.add_argument('--no-browser', action='store_true',
+                            help='Do not open browser automatically')
+    colab_group.add_argument('--gui', action='store_true',
+                            help='Launch GUI interface')
     
     # Config options
     config_group = parser.add_argument_group('configuration options')
@@ -599,6 +801,75 @@ NAMING SCHEMES:
                              help='Reset to default settings')
     
     args = parser.parse_args()
+    
+    # Handle GUI mode - if no sources provided, launch GUI by default
+    if args.gui or (not args.sources and not args.show_config and not args.reset and not args.colab_process):
+        try:
+            import tkinter
+        except ImportError:
+            print("Error: GUI module not available")
+            print("Details: No module named '_tkinter'")
+            print("\nTo fix this issue:")
+            print("  On Ubuntu/Debian: sudo apt-get install python3-tk")
+            print("  On Fedora/RHEL:   sudo dnf install python3-tkinter")
+            print("  On macOS:         brew install python-tk")
+            print("\nAlternatively, ensure your Python installation includes tkinter support.")
+            sys.exit(1)
+        
+        try:
+            import gui
+            gui.main()
+            return
+        except ImportError as e:
+            print("Error: GUI module not available")
+            print(f"Details: {e}")
+            print("\nMake sure gui.py is in the same directory as y2wav.py")
+            sys.exit(1)
+    
+    # Handle Colab processing mode
+    if args.colab_process:
+        try:
+            from colab_integration import ColabIntegration
+            
+            model_params = {
+                "model_type": "mel_band_roformer",
+                "segment_size": args.colab_segment_size,
+                "overlap": args.colab_overlap,
+                "use_gpu": True
+            }
+            
+            notebook_url = args.colab_notebook if args.colab_notebook else None
+            colab = ColabIntegration(notebook_url)
+            
+            result = colab.process_audio_folder(
+                input_dir=args.colab_process,
+                output_dir=args.colab_output,
+                model_params=model_params,
+                open_browser=not args.no_browser
+            )
+            
+            if result['status'] == 'ready':
+                print("\n✓ Colab processing workflow prepared successfully!")
+                print(f"\nZip file created: {result['zip_path']}")
+                print(f"Processing code saved: {result['code_path']}")
+                print(f"Audio files to process: {result['audio_files_count']}")
+                print(f"\nColab notebook: {result['notebook_url']}")
+            else:
+                print(f"\n✗ Error: {result.get('message', 'Unknown error')}")
+                sys.exit(1)
+            
+            return
+            
+        except ImportError as e:
+            print("Error: Colab integration module not available")
+            print(f"Details: {e}")
+            print("\nMake sure colab_integration.py is in the same directory as y2wav.py")
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error during Colab processing: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
     
     # Load config
     config = Config()
@@ -651,6 +922,21 @@ NAMING SCHEMES:
         update_dict['geo_bypass'] = False
     if args.prefer_free_formats:
         update_dict['prefer_free_formats'] = True
+    if args.proxy:
+        update_dict['proxy'] = args.proxy
+    if args.playlist:
+        # When playlist flag is used, force playlist download
+        # This affects how URLs are processed
+        pass  # The playlist detection happens in the download method
+    if args.bitrate:
+        update_dict['bitrate'] = args.bitrate
+    if args.sample_rate:
+        update_dict['sample_rate'] = args.sample_rate
+    if args.hi_res:
+        # When high-res flag is used, set high quality settings
+        update_dict['postprocessor_args'] = 'ffmpeg:-sample_fmt s32'  # Use 32-bit internal for highest quality
+        if not args.sample_rate:  # Only set sample rate if not already specified
+            update_dict['sample_rate'] = '48000'  # Standard high quality sample rate
     
     config.update(**update_dict)
     

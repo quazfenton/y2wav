@@ -1,0 +1,16 @@
+# Core dependencies for y2wav
+yt-dlp>=2023.0.0
+
+# Optional: Google Colab integration (only needed outside Colab)
+google-auth>=2.0.0
+google-auth-oauthlib>=0.4.0
+google-auth-httplib2>=0.1.0
+google-api-python-client>=2.0.0
+
+# GUI dependencies (tkinter is usually pre-installed)
+# No additional packages needed for basic GUI
+
+# Note: ffmpeg must be installed separately (system package)
+# Ubuntu/Debian: sudo apt install ffmpeg
+# macOS: brew install ffmpeg
+# Windows: Download from https://ffmpeg.org/
